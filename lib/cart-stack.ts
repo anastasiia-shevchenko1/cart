@@ -6,6 +6,7 @@ import * as apigateway from 'aws-cdk-lib/aws-apigateway';
 import * as rds from 'aws-cdk-lib/aws-rds';
 import * as ec2 from 'aws-cdk-lib/aws-ec2';
 import { aws_secretsmanager as secretsmanager } from 'aws-cdk-lib';
+import { aws_iam as iam } from 'aws-cdk-lib';
 import { join } from 'path';
 
 export class CartStack extends cdk.Stack {
@@ -25,35 +26,54 @@ export class CartStack extends cdk.Stack {
 
     // Create VPC for the resources
     const vpc = new ec2.Vpc(this, 'CartServiceVPC', {
-      maxAzs: 2,
-      subnetConfiguration: [
-        {
-          cidrMask: 24,
-          name: 'PublicSubnet',
-          subnetType: ec2.SubnetType.PUBLIC,
-        },
-      ],
+      maxAzs: 3,
+      natGateways: 1
+    });
+
+    const parameterGroup = new rds.ParameterGroup(this, 'ParameterGroup', {
+      engine: rds.DatabaseInstanceEngine.postgres({
+        version: rds.PostgresEngineVersion.VER_16_4,
+      }),
+      parameters: {
+        'rds.force_ssl': '1', // Force SSL
+      },
     });
 
     // RDS Database instance
     const dbInstance = new rds.DatabaseInstance(this, 'CartRDSInstance', {
-      engine: rds.DatabaseInstanceEngine.postgres({ version: rds.PostgresEngineVersion.VER_14 }),
-      instanceType: ec2.InstanceType.of(ec2.InstanceClass.BURSTABLE3, ec2.InstanceSize.MICRO),
+      engine: rds.DatabaseInstanceEngine.postgres({
+        version: rds.PostgresEngineVersion.VER_16_4,
+      }),
+      instanceType: ec2.InstanceType.of(ec2.InstanceClass.T3, ec2.InstanceSize.MICRO),
       vpc,
-      credentials: rds.Credentials.fromSecret(dbCredentialsSecret),
-      vpcSubnets: {
-        subnetType: ec2.SubnetType.PUBLIC
-      },
       multiAz: false,
+      publiclyAccessible: true,
+      deletionProtection: false,
+      removalPolicy: cdk.RemovalPolicy.DESTROY,
+      databaseName: 'cartdb',
       allocatedStorage: 20,
       maxAllocatedStorage: 100,
       allowMajorVersionUpgrade: false,
       autoMinorVersionUpgrade: true,
       backupRetention: cdk.Duration.days(7),
       deleteAutomatedBackups: true,
-      removalPolicy: cdk.RemovalPolicy.DESTROY,
-      deletionProtection: false
+      credentials: rds.Credentials.fromSecret(dbCredentialsSecret),
+      parameterGroup,
     });
+
+    const lambdaExecutionRole = new iam.Role(this, 'LambdaExecutionRole', {
+      assumedBy: new iam.ServicePrincipal('lambda.amazonaws.com'),
+      managedPolicies: [
+        iam.ManagedPolicy.fromAwsManagedPolicyName('service-role/AWSLambdaBasicExecutionRole'),
+        iam.ManagedPolicy.fromAwsManagedPolicyName('service-role/AWSLambdaVPCAccessExecutionRole')
+      ],
+    });
+
+    lambdaExecutionRole.addToPolicy(new iam.PolicyStatement({
+      effect: iam.Effect.ALLOW,
+      actions: ['secretsmanager:GetSecretValue'],
+      resources: [dbCredentialsSecret.secretArn],
+    }));
 
     const lambdaFunction = new lambdaNodejs.NodejsFunction(this, 'NestJsLambdaFunction', {
       runtime: lambda.Runtime.NODEJS_20_X,
@@ -67,18 +87,22 @@ export class CartStack extends cdk.Stack {
         DB_PORT: dbInstance.dbInstanceEndpointPort,
         DB_NAME: 'cartdb',
         DB_USER: 'dbmasteruser',
-        DB_PASSWORD_SECRET: dbCredentialsSecret.secretValueFromJson('password').unsafeUnwrap(),
+        DB_PASSWORD_SECRET: dbCredentialsSecret.secretArn,
       },
       vpc,
       allowPublicSubnet: true,
       securityGroups: [dbInstance.connections.securityGroups[0]],
-      timeout: cdk.Duration.seconds(30)
+      memorySize: 1024,
+      timeout: cdk.Duration.seconds(30),
+      role: lambdaExecutionRole,
     });
 
-    const api = new apigateway.LambdaRestApi(this, 'CartServiceApi', {
-      handler: lambdaFunction,
+    dbInstance.connections.allowDefaultPortFrom(lambdaFunction);
+    dbCredentialsSecret.grantRead(lambdaFunction);
+
+    const api = new apigateway.RestApi(this, 'CartServiceApi', {
       restApiName: 'Cart Service API',
-      proxy: false,
+      description: 'This service serves cart API',
       deployOptions: {
         stageName: 'dev',
       },
@@ -88,11 +112,14 @@ export class CartStack extends cdk.Stack {
       },
     });
 
-    const cart = api.root.addResource('api').addResource('profile').addResource('cart');
-    cart.addMethod('GET');  // GET /api/profile/cart
-    cart.addMethod('PUT');  // PUT /api/profile/cart
+    const lambdaIntegration = new apigateway.LambdaIntegration(lambdaFunction);
 
-    const checkout = cart.addResource('checkout');
-    checkout.addMethod('POST'); // POST /api/profile/cart/checkout
+    dbInstance.secret!.grantRead(lambdaFunction);
+    dbInstance.secret!.grantWrite(lambdaFunction);
+    dbInstance.connections.allowDefaultPortFrom(lambdaFunction);
+
+    const cart = api.root.addResource('api').addResource('profile').addResource('cart');
+    cart.addMethod('GET', lambdaIntegration);  // GET /api/profile/cart
+    cart.addMethod('PUT', lambdaIntegration);  // PUT /api/profile/cart
   }
 }

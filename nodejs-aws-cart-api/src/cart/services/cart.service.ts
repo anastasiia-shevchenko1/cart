@@ -1,55 +1,98 @@
 import { Injectable } from '@nestjs/common';
-
+import { Cart, CartStatuses } from '../models';
+import { InjectRepository } from '@nestjs/typeorm';
+import { Repository } from 'typeorm';
 import { v4 } from 'uuid';
-
-import { Cart } from '../models';
+import { CartEntity, CartItemEntity, CartStatus } from './entities';
 
 @Injectable()
 export class CartService {
-  private userCarts: Record<string, Cart> = {};
+  constructor(
+      @InjectRepository(CartEntity)
+      private readonly cartRepository: Repository<CartEntity>,
+      @InjectRepository(CartItemEntity)
+      private readonly cartItemRepository: Repository<CartItemEntity>,
+  ) {}
 
-  findByUserId(userId: string): Cart {
-    return this.userCarts[ userId ];
+  async findByUserId(userId: string): Promise<Cart | null> {
+    const cartEntities = await this.cartRepository.find({ where: { user_id: userId } });
+
+    if (cartEntities.length) {
+      const cartEntity = cartEntities[0];
+      const itemsFromCartItemsEntity = await this.cartItemRepository.find({ where: { cart: { id: cartEntity.id } } });
+
+      const items = itemsFromCartItemsEntity?.length
+          ? itemsFromCartItemsEntity.map((item) => (
+              {
+                product: { id: item.product_id, title: 'string', description: 'description', price: 3 },
+                count: item.count,
+              }
+          ))
+          : [];
+
+      return {
+        id: cartEntity.id,
+        status: cartEntity.status === CartStatus.OPEN ? CartStatuses.OPEN : CartStatuses.ORDERED,
+        user_id: cartEntity.user_id,
+        items,
+        created_at: cartEntity.created_at.toISOString(),
+        updated_at: cartEntity.updated_at.toISOString(),
+      };
+    }
+
+    return null;
   }
 
-  createByUserId(userId: string) {
-    const id = v4();
-    const userCart = {
-      id,
+  async createByUserId(userId: string): Promise<Cart> {
+    const userCart = { user_id: userId, status: CartStatus.OPEN };
+
+    const newCart = await this.cartRepository.create(userCart);
+
+    await this.cartRepository.save(newCart);
+
+    return {
+      ...userCart,
       items: [],
-    } as Cart; // TODO: Fix this
-
-    this.userCarts[ userId ] = userCart;
-
-    return userCart;
+      id: newCart.id ?? userId,
+      created_at: newCart.created_at.toISOString(),
+      updated_at: newCart.updated_at.toISOString(),
+      status: newCart.status === CartStatus.OPEN ? CartStatuses.OPEN : CartStatuses.ORDERED,
+    };
   }
 
-  findOrCreateByUserId(userId: string): Cart {
-    const userCart = this.findByUserId(userId);
+  async findOrCreateByUserId(userId: string): Promise<Cart> {
+    if (!userId) {
+      userId = v4();
+    }
+    const userCart = await this.findByUserId(userId);
 
     if (userCart) {
       return userCart;
     }
 
-    return this.createByUserId(userId);
+    // @ts-ignore
+    return await this.createByUserId(userId);
   }
 
-  updateByUserId(userId: string, { items }: Cart): Cart {
-    const { id, ...rest } = this.findOrCreateByUserId(userId);
+  async updateByUserId(userId: string, { items }: Cart): Promise<Cart> {
+    const { id, ...rest } = await this.findOrCreateByUserId(userId);
+    const updatedCartData = {
+      user_id: rest.user_id,
+      status: rest.status === CartStatuses.OPEN ? CartStatus.OPEN : CartStatus.ORDERED,
+    };
+    await this.cartRepository.update(id, updatedCartData);
+    await this.cartItemRepository.delete({ cart: { id } });
+    const cartItemsToInsert = items.map(({ product, count }) => ({
+      cart: { id },
+      product_id: product.id,
+      count,
+    }));
+    await this.cartItemRepository.save(cartItemsToInsert);
 
-    const updatedCart = {
-      id,
-      ...rest,
-      items: [ ...items ],
-    }
-
-    this.userCarts[ userId ] = { ...updatedCart };
-
-    return { ...updatedCart };
+    return this.findOrCreateByUserId(userId);
   }
 
-  removeByUserId(userId): void {
-    this.userCarts[ userId ] = null;
+  async removeByUserId(userId: string): Promise<void> {
+    await this.cartRepository.delete({ user_id: userId });
   }
-
 }
